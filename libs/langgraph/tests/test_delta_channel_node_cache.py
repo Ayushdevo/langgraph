@@ -11,11 +11,42 @@ from typing_extensions import TypedDict
 
 from langgraph.channels.delta import DeltaChannel
 from langgraph.graph import START, StateGraph
-from langgraph.types import CachePolicy, Durability
+from langgraph.types import CachePolicy, Durability, Send
 
 pytestmark = pytest.mark.anyio
 
 INPUT = {"log": [], "plain": []}
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_duplicate_sends_all_use_warm_cache(async_mode: bool) -> None:
+    runs: list[int] = []
+
+    class State(TypedDict):
+        value: int
+        results: Annotated[list[int], operator.add]
+
+    def worker(state: State) -> dict[str, list[int]]:
+        runs.append(state["value"])
+        return {"results": [state["value"]]}
+
+    def fan_out(state: State) -> list[Send]:
+        return [Send("worker", {"value": value}) for value in (1, 2, 1)]
+
+    builder = StateGraph(State)
+    builder.add_node("worker", worker, cache_policy=CachePolicy())
+    builder.add_conditional_edges(START, fan_out, ["worker"])
+    graph = builder.compile(cache=InMemoryCache())
+
+    inputs = {"value": 0, "results": []}
+    first = await graph.ainvoke(inputs) if async_mode else graph.invoke(inputs)
+    assert first["results"] == [1, 2, 1]
+    assert sorted(runs) == [1, 1, 2]
+    runs.clear()
+
+    second = await graph.ainvoke(inputs) if async_mode else graph.invoke(inputs)
+    assert second["results"] == [1, 2, 1]
+    assert runs == []
 
 
 def _append(current: list, writes: list) -> list:
